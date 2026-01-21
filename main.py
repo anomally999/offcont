@@ -7,13 +7,13 @@ import asyncpg
 import datetime
 import os
 from dotenv import load_dotenv
-from typing import List, Optional, Dict
-from aiohttp import web  # Already a discord.py dep—no extra install
+from typing import List, Optional
+from aiohttp import web
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Render provides this as env var
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -33,7 +33,6 @@ class InactivityBot(commands.Bot):
         self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         await self.create_tables()
         await self.tree.sync()
-        # Start the minimal web server in background
         self.bg_task = self.loop.create_task(self.webserver())
 
     async def webserver(self):
@@ -46,14 +45,13 @@ class InactivityBot(commands.Bot):
         runner = web.AppRunner(app)
         await runner.setup()
 
-        port = int(os.environ.get('PORT', 8080))  # Render provides PORT
+        port = int(os.environ.get('PORT', 8080))
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
-        print(f"Web server started on port {port}")
+        print(f"Web server listening on port {port}")
 
-        # Keep the task alive forever (bot's main loop handles the rest)
         while True:
-            await asyncio.sleep(3600)  # Sleep 1 hour—low overhead
+            await asyncio.sleep(3600)
 
     async def create_tables(self):
         async with self.pool.acquire() as conn:
@@ -81,7 +79,7 @@ class InactivityBot(commands.Bot):
 bot = InactivityBot()
 
 # ────────────────────────────────────────────────
-#              Beautiful Embed Factory
+#              Embed Helpers
 # ────────────────────────────────────────────────
 def create_embed(title: str, color: int = 0x5865F2, description: str = None) -> discord.Embed:
     embed = discord.Embed(
@@ -92,58 +90,38 @@ def create_embed(title: str, color: int = 0x5865F2, description: str = None) -> 
     )
     embed.set_footer(
         text="Activity Tracker • Real messages only",
-        icon_url="https://i.imgur.com/awesomeclock.png"  # replace with real icon if you have one
+        icon_url=bot.user.avatar.url if bot.user and bot.user.avatar else None
     )
-    embed.set_thumbnail(url=bot.user.avatar.url if bot.user.avatar else None)
     return embed
 
 def error_embed(text: str) -> discord.Embed:
-    return create_embed("Error", color=0xED4245, description=f"❌ {text}")
+    return create_embed("Error", 0xED4245, f"❌ {text}")
 
 def success_embed(text: str) -> discord.Embed:
-    return create_embed("Success", color=0x57F287, description=f"✅ {text}")
+    return create_embed("Success", 0x57F287, f"✅ {text}")
 
 # ────────────────────────────────────────────────
-#                   HELP COMMAND
+#              HELP COMMAND
 # ────────────────────────────────────────────────
 @bot.command(name="helpactivity")
 async def text_help(ctx: commands.Context):
-    embed = create_embed("Activity Tracker Commands", color=0xFEE75C)
+    embed = create_embed("Activity Tracker Commands", 0xFEE75C)
     embed.description = (
-        "Tracks **real message activity** per server.\n"
-        "User = active only after sending ≥1 message that day.\n"
-        "After **12 consecutive offline days** → report + ping\n\n"
-        "**Commands:**\n"
+        "Tracks **real message activity** in this server.\n"
+        "→ Active = sent at least 1 message today\n"
+        "→ After **12 consecutive offline days** → automatic alert + ping\n\n"
+        "**Available commands:**"
     )
-    embed.add_field(
-        name=",helpactivity",
-        value="Shows this message",
-        inline=False
-    )
-    embed.add_field(
-        name=",channelset #channel",
-        value="Set report channel",
-        inline=False
-    )
-    embed.add_field(
-        name=",roleset @role1 @role2 ...",
-        value="Roles to ping on report",
-        inline=False
-    )
-    embed.add_field(
-        name=",listinactive",
-        value="Members who didn't message **today**",
-        inline=False
-    )
-    embed.add_field(
-        name="Slash commands",
-        value="Same names without comma:\n`/channelset` `/roleset` `/listinactive`",
-        inline=False
-    )
+    embed.add_field(name=",helpactivity", value="This message", inline=False)
+    embed.add_field(name=",channelset #channel", value="Set alert channel", inline=False)
+    embed.add_field(name=",roleset @role @role...", value="Roles to ping on alerts", inline=False)
+    embed.add_field(name=",chcheck", value="Show current settings", inline=False)
+    embed.add_field(name=",listinactive", value="List members inactive today", inline=False)
+    embed.add_field(name="Slash version", value="Use /channelset /roleset /chcheck /listinactive", inline=False)
     await ctx.send(embed=embed)
 
 # ────────────────────────────────────────────────
-#              EVENTS & ACTIVITY TRACKING
+#              EVENTS
 # ────────────────────────────────────────────────
 @bot.event
 async def on_ready():
@@ -155,12 +133,11 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    guild_id = message.guild.id
-    user_id = message.author.id
+    gid = message.guild.id
+    uid = message.author.id
     today = datetime.date.today()
 
     async with bot.pool.acquire() as conn:
-        # Upsert last active date
         await conn.execute("""
             INSERT INTO user_activity (guild_id, user_id, last_active_date, offline_streak)
             VALUES ($1, $2, $3, 0)
@@ -168,17 +145,16 @@ async def on_message(message: discord.Message):
             DO UPDATE SET
                 last_active_date = EXCLUDED.last_active_date,
                 offline_streak = CASE
-                    WHEN user_activity.last_active_date = ($3 - INTERVAL '1 day')::date
-                    THEN 0
+                    WHEN user_activity.last_active_date = ($3 - INTERVAL '1 day')::date THEN 0
                     ELSE user_activity.offline_streak + 1
                 END
             WHERE user_activity.last_active_date != $3
-        """, guild_id, user_id, today)
+        """, gid, uid, today)
 
     await bot.process_commands(message)
 
 # ────────────────────────────────────────────────
-#              BACKGROUND CHECK (midnight-ish)
+#              AUTO ALERT (12+ days)
 # ────────────────────────────────────────────────
 @tasks.loop(hours=1)
 async def check_inactivity_loop():
@@ -188,69 +164,114 @@ async def check_inactivity_loop():
     today = datetime.date.today()
 
     async with bot.pool.acquire() as conn:
-        guilds = await conn.fetch("SELECT guild_id, report_channel_id, role_ids FROM guild_settings WHERE report_channel_id IS NOT NULL")
+        guilds = await conn.fetch("""
+            SELECT guild_id, report_channel_id, role_ids
+            FROM guild_settings
+            WHERE report_channel_id IS NOT NULL
+        """)
 
-        for record in guilds:
-            guild_id, channel_id, role_ids = record
-            guild = bot.get_guild(guild_id)
+        for rec in guilds:
+            gid, chid, rids = rec
+            guild = bot.get_guild(gid)
             if not guild:
                 continue
 
-            channel = guild.get_channel(channel_id)
+            channel = guild.get_channel(chid)
             if not channel or not isinstance(channel, discord.TextChannel):
                 continue
 
-            # Get all tracked users who are long inactive
-            inactive_long = await conn.fetch("""
-                SELECT user_id, offline_streak + CASE WHEN last_active_date != $2 THEN 1 ELSE 0 END AS current_streak
+            inactive = await conn.fetch("""
+                SELECT user_id,
+                       offline_streak + (CURRENT_DATE - last_active_date) AS current_streak
                 FROM user_activity
                 WHERE guild_id = $1
-                AND last_active_date < $2 - INTERVAL '11 days'
+                  AND last_active_date <= CURRENT_DATE - INTERVAL '12 days'
                 ORDER BY current_streak DESC
-            """, guild_id, today)
+            """, gid)
 
-            # Also add untracked members as streak = infinity or something, but for now, since 12+ is for tracked, perhaps keep as is
-            # But to include untracked in long inactive, we need to assume their streak
-            # For simplicity, perhaps initialize all members on ready, but that could be heavy
-            # Or skip untracked for long report, as they never were active
-
-            if not inactive_long:
+            if not inactive:
                 continue
 
-            roles = [guild.get_role(rid) for rid in role_ids if guild.get_role(rid)]
+            roles = [guild.get_role(rid) for rid in rids if guild.get_role(rid)]
             ping = " ".join(r.mention for r in roles if r) or "@here"
 
-            embed = create_embed("Long-term Inactive Members", color=0xED4245)
-            embed.description = f"**12+ days** without any message • {today:%Y-%m-%d}"
+            embed = create_embed("Long-term Inactive Members", 0xED4245)
+            embed.description = f"**12+ consecutive days** offline • {today:%Y-%m-%d}"
 
             lines = []
-            for row in inactive_long[:15]:  # limit to avoid huge messages
+            for row in inactive[:12]:
                 member = guild.get_member(row["user_id"])
                 if not member:
                     continue
-                name = member.display_name
-                lines.append(f"• {name}  —  **{row['current_streak']}** days")
+                name = member.mention if member else f"<@{row['user_id']}>"
+                lines.append(f"• {name} — **{row['current_streak']}** days")
 
             embed.add_field(
-                name=f"Offline ≥ 12 days ({len(inactive_long)} total)",
-                value="\n".join(lines) or "None found",
+                name=f"Members ({len(inactive)} total)",
+                value="\n".join(lines) or "None",
                 inline=False
             )
 
-            if len(inactive_long) > 15:
-                embed.add_field(name="Note", value=f"...and {len(inactive_long)-15} more", inline=False)
+            if len(inactive) > 12:
+                embed.add_field(name="Note", value=f"...and {len(inactive)-12} more", inline=False)
 
             await channel.send(ping, embed=embed)
 
 # ────────────────────────────────────────────────
-#                   SLASH COMMANDS
+#              PAGINATION FOR LISTINACTIVE
 # ────────────────────────────────────────────────
-@bot.tree.command(name="channelset", description="Set channel for long-inactivity reports")
-@app_commands.describe(channel="Where to send the 12+ days reports")
+class InactivePagination(discord.ui.View):
+    def __init__(self, members: List[discord.Member], per_page: int = 15):
+        super().__init__(timeout=600)
+        self.members = members
+        self.per_page = per_page
+        self.page = 0
+        self.max_page = (len(members) + per_page - 1) // per_page - 1
+
+        self.previous.disabled = True
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.previous.disabled = self.page == 0
+        self.next.disabled = self.page >= self.max_page
+
+    def get_embed(self) -> discord.Embed:
+        start = self.page * self.per_page
+        end = start + self.per_page
+        page_members = self.members[start:end]
+
+        embed = create_embed(
+            f"Members Inactive Today ({len(self.members)} total)",
+            0x5865F2,
+            f"Page {self.page+1}/{self.max_page+1}"
+        )
+
+        embed.description = "\n".join(
+            f"• {m.mention} ({m.display_name})" for m in page_members
+        ) or "No one on this page"
+
+        return embed
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.grey)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.grey)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+# ────────────────────────────────────────────────
+#              SLASH COMMANDS
+# ────────────────────────────────────────────────
+@bot.tree.command(name="channelset", description="Set the channel for inactivity alerts")
+@app_commands.describe(channel="Channel where alerts will be sent")
 async def slash_channelset(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(embed=error_embed("Manage Server permission required."), ephemeral=True)
-        return
+        return await interaction.response.send_message(embed=error_embed("Requires Manage Server permission"), ephemeral=True)
 
     async with bot.pool.acquire() as conn:
         await conn.execute("""
@@ -259,67 +280,96 @@ async def slash_channelset(interaction: discord.Interaction, channel: discord.Te
             ON CONFLICT (guild_id) DO UPDATE SET report_channel_id = $2
         """, interaction.guild_id, channel.id)
 
-    await interaction.response.send_message(embed=success_embed(f"Report channel → {channel.mention}"), ephemeral=True)
+    await interaction.response.send_message(embed=success_embed(f"Alert channel set to {channel.mention}"), ephemeral=True)
 
-@bot.tree.command(name="roleset", description="Roles to ping when sending long-inactivity list")
-@app_commands.describe(roles="Mention roles here (multiple ok)")
-async def slash_roleset(interaction: discord.Interaction, roles: str):
+@bot.tree.command(name="roleset", description="Set roles to ping on inactivity alerts (up to 5)")
+@app_commands.describe(
+    role1="Required role to ping",
+    role2="Optional second role",
+    role3="Optional third role",
+    role4="Optional fourth role",
+    role5="Optional fifth role"
+)
+async def slash_roleset(
+    interaction: discord.Interaction,
+    role1: discord.Role,
+    role2: Optional[discord.Role] = None,
+    role3: Optional[discord.Role] = None,
+    role4: Optional[discord.Role] = None,
+    role5: Optional[discord.Role] = None
+):
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(embed=error_embed("Manage Server permission required."), ephemeral=True)
-        return
+        return await interaction.response.send_message(embed=error_embed("Requires Manage Server permission"), ephemeral=True)
 
-    role_ids = [r.id for r in interaction.message.role_mentions] if interaction.message else []
-    if not role_ids:
-        await interaction.response.send_message(embed=error_embed("No roles detected. Mention them like @role"), ephemeral=True)
-        return
+    roles = [r for r in [role1, role2, role3, role4, role5] if r]
+    if not roles:
+        return await interaction.response.send_message(embed=error_embed("Select at least one role"), ephemeral=True)
+
+    role_ids = [r.id for r in roles]
 
     async with bot.pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO guild_settings (guild_id, role_ids)
-            VALUES ($1, $2)
-            ON CONFLICT (guild_id) DO UPDATE SET role_ids = $2
+            VALUES ($1, $2::bigint[])
+            ON CONFLICT (guild_id) DO UPDATE SET role_ids = $2::bigint[]
         """, interaction.guild_id, role_ids)
 
-    roles_mention = " ".join(f"<@&{rid}>" for rid in role_ids)
-    await interaction.response.send_message(embed=success_embed(f"Ping roles updated:\n{roles_mention}"), ephemeral=True)
+    mentions = " ".join(r.mention for r in roles)
+    await interaction.response.send_message(embed=success_embed(f"Roles set:\n{mentions}"), ephemeral=True)
 
-@bot.tree.command(name="listinactive", description="Show members who haven't messaged today")
+@bot.tree.command(name="chcheck", description="View current alert settings")
+async def slash_chcheck(interaction: discord.Interaction):
+    async with bot.pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT report_channel_id, role_ids
+            FROM guild_settings WHERE guild_id = $1
+        """, interaction.guild_id)
+
+    if not row or not row["report_channel_id"]:
+        return await interaction.response.send_message(embed=error_embed("No settings configured yet"), ephemeral=True)
+
+    channel = interaction.guild.get_channel(row["report_channel_id"])
+    ch_mention = channel.mention if channel else f"Deleted channel (ID: {row['report_channel_id']})"
+
+    roles_str = " ".join(f"<@&{rid}>" for rid in row["role_ids"]) or "No roles set"
+
+    embed = create_embed("Current Alert Settings", 0x3498DB)
+    embed.add_field(name="Alert Channel", value=ch_mention, inline=False)
+    embed.add_field(name="Ping Roles", value=roles_str, inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="listinactive", description="Show who hasn't messaged today (paginated)")
 async def slash_listinactive(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
 
     guild = interaction.guild
     today = datetime.date.today()
 
     async with bot.pool.acquire() as conn:
-        active_ids = await conn.fetch("""
-            SELECT user_id
-            FROM user_activity
+        active = await conn.fetch("""
+            SELECT user_id FROM user_activity
             WHERE guild_id = $1 AND last_active_date = $2
         """, guild.id, today)
 
-    active_set = {row['user_id'] for row in active_ids}
+    active_ids = {r["user_id"] for r in active}
 
-    inactive = [m for m in guild.members if not m.bot and m.id not in active_set]
-
-    if not inactive:
-        await interaction.followup.send(embed=success_embed("Everyone was active today! 🎉"), ephemeral=True)
-        return
-
+    inactive = [m for m in guild.members if not m.bot and m.id not in active_ids]
     inactive.sort(key=lambda m: m.display_name.lower())
 
-    embed = create_embed(f"Inactive Today ({len(inactive)})", color=0x5865F2)
-    lines = [f"• {m.mention} ({m.display_name})" for m in inactive[:35]]
-    embed.description = "\n".join(lines) + (f"\n\n...and {len(inactive)-35} more" if len(inactive)>35 else "")
+    if not inactive:
+        return await interaction.followup.send(embed=success_embed("Everyone has been active today! 🎉"))
 
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    view = InactivePagination(inactive)
+    await interaction.followup.send(embed=view.get_embed(), view=view)
 
 # ────────────────────────────────────────────────
-#               TEXT PREFIX VERSIONS
+#              TEXT PREFIX COMMANDS
 # ────────────────────────────────────────────────
 @bot.command(name="channelset")
 async def text_channelset(ctx: commands.Context, channel: discord.TextChannel):
     if not ctx.author.guild_permissions.manage_guild:
-        return await ctx.send(embed=error_embed("Manage Server required."))
+        return await ctx.send(embed=error_embed("Manage Server required"))
 
     async with bot.pool.acquire() as conn:
         await conn.execute("""
@@ -328,27 +378,49 @@ async def text_channelset(ctx: commands.Context, channel: discord.TextChannel):
             ON CONFLICT (guild_id) DO UPDATE SET report_channel_id = $2
         """, ctx.guild.id, channel.id)
 
-    await ctx.send(embed=success_embed(f"Report channel set: {channel.mention}"))
+    await ctx.send(embed=success_embed(f"Alert channel → {channel.mention}"))
 
 @bot.command(name="roleset")
-async def text_roleset(ctx: commands.Context, *, roles_str: str):
+async def text_roleset(ctx: commands.Context, *, content: str = ""):
     if not ctx.author.guild_permissions.manage_guild:
-        return await ctx.send(embed=error_embed("Manage Server required."))
+        return await ctx.send(embed=error_embed("Manage Server required"))
 
-    role_mentions = ctx.message.role_mentions
-    if not role_mentions:
-        return await ctx.send(embed=error_embed("Mention roles like @role @role2"))
+    roles = ctx.message.role_mentions
+    if not roles:
+        return await ctx.send(embed=error_embed("Mention at least one role\nExample: ,roleset @Staff @Moderators"))
 
-    role_ids = [r.id for r in role_mentions]
+    role_ids = [r.id for r in roles]
 
     async with bot.pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO guild_settings (guild_id, role_ids)
-            VALUES ($1, $2)
-            ON CONFLICT (guild_id) DO UPDATE SET role_ids = $2
+            VALUES ($1, $2::bigint[])
+            ON CONFLICT (guild_id) DO UPDATE SET role_ids = $2::bigint[]
         """, ctx.guild.id, role_ids)
 
-    await ctx.send(embed=success_embed(f"Roles updated: {' '.join(r.mention for r in role_mentions)}"))
+    await ctx.send(embed=success_embed(f"Roles set: {' '.join(r.mention for r in roles)}"))
+
+@bot.command(name="chcheck")
+async def text_chcheck(ctx: commands.Context):
+    async with bot.pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT report_channel_id, role_ids FROM guild_settings
+            WHERE guild_id = $1
+        """, ctx.guild.id)
+
+    if not row or not row["report_channel_id"]:
+        return await ctx.send(embed=error_embed("No settings configured yet"))
+
+    channel = ctx.guild.get_channel(row["report_channel_id"])
+    ch_text = channel.mention if channel else f"Deleted (ID: {row['report_channel_id']})"
+
+    roles_text = " ".join(f"<@&{rid}>" for rid in row["role_ids"]) or "None"
+
+    embed = create_embed("Current Settings", 0x3498DB)
+    embed.add_field(name="Alert Channel", value=ch_text, inline=False)
+    embed.add_field(name="Ping Roles", value=roles_text, inline=False)
+
+    await ctx.send(embed=embed)
 
 @bot.command(name="listinactive")
 async def text_listinactive(ctx: commands.Context):
@@ -356,29 +428,24 @@ async def text_listinactive(ctx: commands.Context):
     today = datetime.date.today()
 
     async with bot.pool.acquire() as conn:
-        active_ids = await conn.fetch("""
-            SELECT user_id
-            FROM user_activity
+        active = await conn.fetch("""
+            SELECT user_id FROM user_activity
             WHERE guild_id = $1 AND last_active_date = $2
         """, guild.id, today)
 
-    active_set = {row['user_id'] for row in active_ids}
+    active_ids = {r["user_id"] for r in active}
 
-    inactive = [m for m in guild.members if not m.bot and m.id not in active_set]
-
-    if not inactive:
-        return await ctx.send(embed=success_embed("No one inactive today!"))
-
+    inactive = [m for m in guild.members if not m.bot and m.id not in active_ids]
     inactive.sort(key=lambda m: m.display_name.lower())
 
-    embed = create_embed(f"Inactive Today • {len(inactive)}", color=0x3498DB)
-    lines = [f"• {m.mention} ({m.display_name})" for m in inactive[:30]]
-    embed.description = "\n".join(lines) + (f"\n... +{len(inactive)-30} more" if len(inactive)>30 else "")
+    if not inactive:
+        return await ctx.send(embed=success_embed("Everyone has been active today!"))
 
-    await ctx.send(embed=embed)
+    view = InactivePagination(inactive)
+    await ctx.send(embed=view.get_embed(), view=view)
 
 # ────────────────────────────────────────────────
-#                    RUN
+#              RUN
 # ────────────────────────────────────────────────
 async def main():
     async with bot:
