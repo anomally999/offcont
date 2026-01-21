@@ -200,14 +200,19 @@ async def check_inactivity_loop():
             if not channel or not isinstance(channel, discord.TextChannel):
                 continue
 
-            # Get users with high streak or inactive today
+            # Get all tracked users who are long inactive
             inactive_long = await conn.fetch("""
-                SELECT user_id, offline_streak
+                SELECT user_id, offline_streak + CASE WHEN last_active_date != $2 THEN 1 ELSE 0 END AS current_streak
                 FROM user_activity
                 WHERE guild_id = $1
-                  AND last_active_date < $2
-                ORDER BY offline_streak DESC
-            """, guild_id, today - datetime.timedelta(days=11))  # 12+ days means last < today-11
+                AND last_active_date < $2 - INTERVAL '11 days'
+                ORDER BY current_streak DESC
+            """, guild_id, today)
+
+            # Also add untracked members as streak = infinity or something, but for now, since 12+ is for tracked, perhaps keep as is
+            # But to include untracked in long inactive, we need to assume their streak
+            # For simplicity, perhaps initialize all members on ready, but that could be heavy
+            # Or skip untracked for long report, as they never were active
 
             if not inactive_long:
                 continue
@@ -221,8 +226,10 @@ async def check_inactivity_loop():
             lines = []
             for row in inactive_long[:15]:  # limit to avoid huge messages
                 member = guild.get_member(row["user_id"])
-                name = member.display_name if member else f"<@{row['user_id']}> (left?)"
-                lines.append(f"• {name}  —  **{row['offline_streak']}** days")
+                if not member:
+                    continue
+                name = member.display_name
+                lines.append(f"• {name}  —  **{row['current_streak']}** days")
 
             embed.add_field(
                 name=f"Offline ≥ 12 days ({len(inactive_long)} total)",
@@ -280,27 +287,29 @@ async def slash_roleset(interaction: discord.Interaction, roles: str):
 async def slash_listinactive(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
+    guild = interaction.guild
     today = datetime.date.today()
+
     async with bot.pool.acquire() as conn:
-        records = await conn.fetch("""
+        active_ids = await conn.fetch("""
             SELECT user_id
             FROM user_activity
-            WHERE guild_id = $1 AND last_active_date != $2
-            ORDER BY user_id
-        """, interaction.guild_id, today)
+            WHERE guild_id = $1 AND last_active_date = $2
+        """, guild.id, today)
 
-    if not records:
+    active_set = {row['user_id'] for row in active_ids}
+
+    inactive = [m for m in guild.members if not m.bot and m.id not in active_set]
+
+    if not inactive:
         await interaction.followup.send(embed=success_embed("Everyone was active today! 🎉"), ephemeral=True)
         return
 
-    members = [interaction.guild.get_member(r["user_id"]) for r in records]
-    members = [m for m in members if m]  # filter None
+    inactive.sort(key=lambda m: m.display_name.lower())
 
-    members.sort(key=lambda m: m.display_name.lower())
-
-    embed = create_embed(f"Inactive Today ({len(members)})", color=0x5865F2)
-    lines = [f"• {m.mention} ({m.display_name})" for m in members[:35]]
-    embed.description = "\n".join(lines) + (f"\n\n...and {len(members)-35} more" if len(members)>35 else "")
+    embed = create_embed(f"Inactive Today ({len(inactive)})", color=0x5865F2)
+    lines = [f"• {m.mention} ({m.display_name})" for m in inactive[:35]]
+    embed.description = "\n".join(lines) + (f"\n\n...and {len(inactive)-35} more" if len(inactive)>35 else "")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -343,21 +352,29 @@ async def text_roleset(ctx: commands.Context, *, roles_str: str):
 
 @bot.command(name="listinactive")
 async def text_listinactive(ctx: commands.Context):
+    guild = ctx.guild
     today = datetime.date.today()
+
     async with bot.pool.acquire() as conn:
-        records = await conn.fetch("""
+        active_ids = await conn.fetch("""
             SELECT user_id
             FROM user_activity
-            WHERE guild_id = $1 AND last_active_date != $2
-        """, ctx.guild.id, today)
+            WHERE guild_id = $1 AND last_active_date = $2
+        """, guild.id, today)
 
-    if not records:
+    active_set = {row['user_id'] for row in active_ids}
+
+    inactive = [m for m in guild.members if not m.bot and m.id not in active_set]
+
+    if not inactive:
         return await ctx.send(embed=success_embed("No one inactive today!"))
 
-    members = [ctx.guild.get_member(r["user_id"]) for r in records if ctx.guild.get_member(r["user_id"])]
-    embed = create_embed(f"Inactive Today • {len(members)}", color=0x3498DB)
-    embed.description = "\n".join(f"• {m.mention}" for m in members[:30]) + \
-                        (f"\n... +{len(members)-30} more" if len(members)>30 else "")
+    inactive.sort(key=lambda m: m.display_name.lower())
+
+    embed = create_embed(f"Inactive Today • {len(inactive)}", color=0x3498DB)
+    lines = [f"• {m.mention} ({m.display_name})" for m in inactive[:30]]
+    embed.description = "\n".join(lines) + (f"\n... +{len(inactive)-30} more" if len(inactive)>30 else "")
+
     await ctx.send(embed=embed)
 
 # ────────────────────────────────────────────────
