@@ -1,4 +1,4 @@
-# bot.py
+# main.py  # or bot.py — whatever you named it
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -31,7 +31,7 @@ class InactivityBot(commands.Bot):
     async def setup_hook(self):
         self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         await self.create_tables()
-        self.tree.copy_global_to(guild=None)  # global slash commands
+        # Removed: self.tree.copy_global_to(guild=None)  # Not needed for global sync
         await self.tree.sync()
 
     async def create_tables(self):
