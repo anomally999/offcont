@@ -1,4 +1,4 @@
-# main.py  # or bot.py — whatever you named it
+# main.py
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -8,6 +8,7 @@ import datetime
 import os
 from dotenv import load_dotenv
 from typing import List, Optional, Dict
+from aiohttp import web  # Already a discord.py dep—no extra install
 
 load_dotenv()
 
@@ -31,8 +32,28 @@ class InactivityBot(commands.Bot):
     async def setup_hook(self):
         self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         await self.create_tables()
-        # Removed: self.tree.copy_global_to(guild=None)  # Not needed for global sync
         await self.tree.sync()
+        # Start the minimal web server in background
+        self.bg_task = self.loop.create_task(self.webserver())
+
+    async def webserver(self):
+        async def handle(request):
+            return web.Response(text="Bot is running")
+
+        app = web.Application()
+        app.add_routes([web.get('/', handle)])
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+
+        port = int(os.environ.get('PORT', 8080))  # Render provides PORT
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        print(f"Web server started on port {port}")
+
+        # Keep the task alive forever (bot's main loop handles the rest)
+        while True:
+            await asyncio.sleep(3600)  # Sleep 1 hour—low overhead
 
     async def create_tables(self):
         async with self.pool.acquire() as conn:
