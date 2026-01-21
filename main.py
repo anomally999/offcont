@@ -383,58 +383,27 @@ async def slash_active(inter: discord.Interaction):
     msg = await inter.followup.send(embed=view.build(), view=view)
     view.msg = msg
 
-# ---------- NEW COMMAND ----------
-class Counters(NamedTuple):
-    today_on: int
-    today_off: int
-    week_on: int
-    week_off: int
-    total_on: int
-    total_off: int
-
-async def fetch_counters(guild_id: int, user_id: int) -> Counters:
-    today = datetime.date.today()
+@bot.tree.command(name="purgeactivity", description="Erase activity records older than X days (GDPR)")
+@app_commands.describe(days="Retention window (1-365)")
+@commands.cooldown(1, 60, commands.BucketType.guild)
+async def slash_purge(inter: discord.Interaction, days: app_commands.Range[int, 1, 365]):
+    if not inter.user.guild_permissions.manage_guild:
+        return await inter.response.send_message(embed=error("Manage Server permission required"), ephemeral=True)
+    cutoff = datetime.date.today() - datetime.timedelta(days=days)
     async with bot.pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT online_days, offline_days, total_online, total_offline, last_active_date
-            FROM user_activity
-            WHERE guild_id=$1 AND user_id=$2
-        """, guild_id, user_id)
-    if not row:
-        return Counters(0, 1, 0, 1, 0, 1)  # never seen = offline today
-    last = row["last_active_date"]
-    today_on = 1 if last == today else 0
-    today_off = 0 if last == today else 1
-    week_on = row["online_days"]
-    week_off = row["offline_days"]
-    total_on = row["total_online"]
-    total_off = row["total_offline"]
-    return Counters(today_on, today_off, week_on, week_off, total_on, total_off)
+        deleted = await conn.fetchval("""
+            DELETE FROM user_activity
+            WHERE guild_id=$1 AND last_active_date < $2
+            RETURNING COUNT(*)
+        """, inter.guild_id, cutoff)
+    await inter.response.send_message(embed=success(f"🗑️ Purged **{deleted}** ancient records"), ephemeral=True)
 
-@bot.tree.command(name="tgoo", description="Show your online/offline counters (today, 7-day, total)")
-@commands.cooldown(COMMAND_COOLDOWN, COMMAND_COOLDOWN, commands.BucketType.user)
-async def slash_tgoo(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=False)
-    counters = await fetch_counters(inter.guild_id, inter.user.id)
-
-    def bar(percent: float) -> str:
-        p = int(percent * 10)
-        return "🟩" * p + "⬜" * (10 - p)
-
-    e = royal_embed("📊 Thy Online/Offline Scroll", 0xF1C40F)
-    # Today
-    today_total = counters.today_on + counters.today_off
-    today_pct = counters.today_on / today_total if today_total else 0
-    e.add_field(name="📅 Today", value=f"{bar(today_pct)}  `{counters.today_on} online · {counters.today_off} offline`", inline=False)
-    # 7 days
-    week_total = counters.week_on + counters.week_off
-    week_pct = counters.week_on / week_total if week_total else 0
-    e.add_field(name="📆 Last 7 Days", value=f"{bar(week_pct)}  `{counters.week_on} online · {counters.week_off} offline`", inline=False)
-    # Total
-    total = counters.total_on + counters.total_off
-    total_pct = counters.total_on / total if total else 0
-    e.add_field(name="🕰️ Total", value=f"{bar(total_pct)}  `{counters.total_on} online · {counters.total_off} offline`", inline=False)
-    await inter.followup.send(embed=e)
+# ---------- TEXT PREFIX COPIES (with cooldowns) ----------
+for cmd in ("listinactive", "active", "chcheck", "channelset", "roleset"):
+    if bot.get_command(cmd):
+        bot.get_command(cmd).callback = commands.cooldown(
+            COMMAND_COOLDOWN, COMMAND_COOLDOWN, commands.BucketType.user
+        )(bot.get_command(cmd).callback)
 
 # ---------- RUN ----------
 bot.run(TOKEN)
