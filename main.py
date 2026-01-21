@@ -37,6 +37,7 @@ class RoyalActivityBot(commands.Bot):
                          description="📊 Royal Activity Tracker – 7-day rolling online/offline")
         self.pool: Optional[asyncpg.Pool] = None
         self._avatar: Optional[str] = None
+        self.db_ready = asyncio.Event()
 
     async def setup_hook(self):
         self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, command_timeout=30)
@@ -48,6 +49,7 @@ class RoyalActivityBot(commands.Bot):
         midnight_scan.start()
         retention_cleanup.start()
         weekly_reset.start()
+        self.db_ready.set()
 
     async def web_server(self):
         async def handle(_):
@@ -86,6 +88,7 @@ class RoyalActivityBot(commands.Bot):
                 CREATE INDEX IF NOT EXISTS idx_activity_scan
                     ON user_activity(guild_id, last_active_date);
             """)
+        log.info("Database tables created/verified")
 
     async def close(self):
         if self.pool:
@@ -146,34 +149,63 @@ async def on_guild_join(guild: discord.Guild):
 async def on_message(msg: discord.Message):
     if msg.author.bot or not msg.guild:
         return
+    
+    # Wait for database to be ready
+    await bot.db_ready.wait()
+    
     today = datetime.date.today()
     week_start = today - datetime.timedelta(days=(today.weekday() + 1) % 7)  # Sunday 00:00
-    async with bot.pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO user_activity(guild_id, user_id, last_active_date, online_days, offline_days,
-                                      week_start, total_online, total_offline)
-            VALUES ($1,$2,$3,1,0,$4,1,0)
-            ON CONFLICT (guild_id, user_id) DO UPDATE
-                SET last_active_date = $3,
-                    online_days      = CASE
-                                         WHEN EXCLUDED.week_start = user_activity.week_start
-                                         THEN GREATEST(user_activity.online_days + 1, 1)
-                                         ELSE 1
-                                       END,
-                    offline_days     = CASE
-                                         WHEN EXCLUDED.week_start = user_activity.week_start
-                                         THEN user_activity.offline_days
-                                         ELSE 0
-                                       END,
-                    week_start       = EXCLUDED.week_start,
-                    total_online     = user_activity.total_online + 1
-            WHERE user_activity.last_active_date <> $3
-        """, msg.guild.id, msg.author.id, today, week_start)
+    
+    try:
+        async with bot.pool.acquire() as conn:
+            # First, check if the user already has an entry for today
+            existing = await conn.fetchrow("""
+                SELECT last_active_date, online_days, offline_days, total_online
+                FROM user_activity
+                WHERE guild_id=$1 AND user_id=$2
+            """, msg.guild.id, msg.author.id)
+            
+            if existing:
+                last_active = existing["last_active_date"]
+                if last_active != today:  # First message today
+                    # Update for new day
+                    await conn.execute("""
+                        UPDATE user_activity
+                        SET last_active_date = $3,
+                            online_days = CASE 
+                                WHEN week_start = $4 THEN online_days + 1 
+                                ELSE 1 
+                            END,
+                            offline_days = CASE 
+                                WHEN week_start = $4 THEN offline_days 
+                                ELSE 0 
+                            END,
+                            week_start = $4,
+                            total_online = total_online + 1
+                        WHERE guild_id=$1 AND user_id=$2
+                    """, msg.guild.id, msg.author.id, today, week_start)
+            else:
+                # New user
+                await conn.execute("""
+                    INSERT INTO user_activity(guild_id, user_id, last_active_date, online_days, offline_days,
+                                              week_start, total_online, total_offline)
+                    VALUES ($1,$2,$3,1,0,$4,1,0)
+                """, msg.guild.id, msg.author.id, today, week_start)
+                
+    except asyncpg.exceptions.UndefinedColumnError:
+        # Table might not exist yet, recreate it
+        log.warning("Database schema issue detected, recreating tables...")
+        await bot.create_tables()
+        return
+    except Exception as e:
+        log.error("Error in on_message: %s", e)
+    
     await bot.process_commands(msg)
 
 # ---------- BACKGROUND TASKS ----------
 @tasks.loop(time=datetime.time(0, 0, tzinfo=datetime.UTC))
 async def midnight_scan():
+    await bot.db_ready.wait()
     today = datetime.date.today()
     async with bot.pool.acquire() as conn:
         for rec in await conn.fetch("""
@@ -214,6 +246,7 @@ async def midnight_scan():
 
 @tasks.loop(hours=24)
 async def retention_cleanup():
+    await bot.db_ready.wait()
     cutoff = datetime.date.today() - datetime.timedelta(days=RETENTION_DAYS)
     async with bot.pool.acquire() as conn:
         await conn.execute("DELETE FROM user_activity WHERE last_active_date < $1", cutoff)
@@ -221,6 +254,7 @@ async def retention_cleanup():
 
 @tasks.loop(time=datetime.time(0, 0, tzinfo=datetime.UTC))
 async def weekly_reset():
+    await bot.db_ready.wait()
     today = datetime.date.today()
     sunday = today - datetime.timedelta(days=(today.weekday() + 1) % 7)  # Sunday reset
     async with bot.pool.acquire() as conn:
@@ -284,6 +318,7 @@ class MemberPages(discord.ui.View):
 @app_commands.describe(channel="Channel where the decree will be proclaimed")
 @commands.cooldown(COMMAND_COOLDOWN, COMMAND_COOLDOWN, commands.BucketType.user)
 async def slash_channelset(inter: discord.Interaction, channel: discord.TextChannel):
+    await bot.db_ready.wait()
     if not inter.user.guild_permissions.manage_guild:
         return await inter.response.send_message(embed=error("Manage Server permission required"), ephemeral=True)
     async with bot.pool.acquire() as conn:
@@ -303,6 +338,7 @@ async def slash_roleset(inter: discord.Interaction,
                         r3: Optional[discord.Role] = None,
                         r4: Optional[discord.Role] = None,
                         r5: Optional[discord.Role] = None):
+    await bot.db_ready.wait()
     if not inter.user.guild_permissions.manage_guild:
         return await inter.response.send_message(embed=error("Manage Server permission required"), ephemeral=True)
     roles = [r for r in [r1, r2, r3, r4, r5] if r and not r.is_default() and not r.managed]
@@ -321,6 +357,7 @@ async def slash_roleset(inter: discord.Interaction,
 @bot.tree.command(name="chcheck", description="View current court settings")
 @commands.cooldown(COMMAND_COOLDOWN, COMMAND_COOLDOWN, commands.BucketType.user)
 async def slash_chcheck(inter: discord.Interaction):
+    await bot.db_ready.wait()
     async with bot.pool.acquire() as conn:
         row = await conn.fetchrow("SELECT report_channel_id, role_ids, alert_threshold FROM guild_settings WHERE guild_id=$1",
                                   inter.guild_id)
@@ -339,6 +376,7 @@ async def slash_chcheck(inter: discord.Interaction):
 @app_commands.describe(days="1-90 days")
 @commands.cooldown(COMMAND_COOLDOWN, COMMAND_COOLDOWN, commands.BucketType.user)
 async def slash_setthreshold(inter: discord.Interaction, days: app_commands.Range[int, 1, 90]):
+    await bot.db_ready.wait()
     if not inter.user.guild_permissions.manage_guild:
         return await inter.response.send_message(embed=error("Manage Server permission required"), ephemeral=True)
     async with bot.pool.acquire() as conn:
@@ -352,6 +390,7 @@ async def slash_setthreshold(inter: discord.Interaction, days: app_commands.Rang
 @bot.tree.command(name="listinactive", description="Who shirked their duties today (paginated)")
 @commands.cooldown(COMMAND_COOLDOWN, COMMAND_COOLDOWN, commands.BucketType.user)
 async def slash_listinactive(inter: discord.Interaction):
+    await bot.db_ready.wait()
     await inter.response.defer(ephemeral=False)
     today = datetime.date.today()
     async with bot.pool.acquire() as conn:
@@ -370,6 +409,7 @@ async def slash_listinactive(inter: discord.Interaction):
 @bot.tree.command(name="active", description="Who served the crown today (paginated)")
 @commands.cooldown(COMMAND_COOLDOWN, COMMAND_COOLDOWN, commands.BucketType.user)
 async def slash_active(inter: discord.Interaction):
+    await bot.db_ready.wait()
     await inter.response.defer(ephemeral=False)
     today = datetime.date.today()
     async with bot.pool.acquire() as conn:
@@ -395,22 +435,30 @@ class Counters(NamedTuple):
     total_off: int
 
 async def fetch_counters(guild_id: int, user_id: int) -> Counters:
+    await bot.db_ready.wait()
     today = datetime.date.today()
     async with bot.pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT online_days, offline_days, total_online, total_offline, last_active_date
-            FROM user_activity
-            WHERE guild_id=$1 AND user_id=$2
-        """, guild_id, user_id)
+        try:
+            row = await conn.fetchrow("""
+                SELECT online_days, offline_days, total_online, total_offline, last_active_date
+                FROM user_activity
+                WHERE guild_id=$1 AND user_id=$2
+            """, guild_id, user_id)
+        except asyncpg.exceptions.UndefinedColumnError:
+            # Table might not have the columns, create them
+            await bot.create_tables()
+            row = None
+    
     if not row:
         return Counters(0, 1, 0, 1, 0, 1)  # never seen = offline today
+    
     last = row["last_active_date"]
     today_on = 1 if last == today else 0
     today_off = 0 if last == today else 1
-    week_on = row["online_days"]
-    week_off = row["offline_days"]
-    total_on = row["total_online"]
-    total_off = row["total_offline"]
+    week_on = row["online_days"] or 0
+    week_off = row["offline_days"] or 0
+    total_on = row["total_online"] or 0
+    total_off = row["total_offline"] or 0
     return Counters(today_on, today_off, week_on, week_off, total_on, total_off)
 
 @bot.tree.command(name="tgoo", description="Show your online/offline counters (today, 7-day, total)")
@@ -438,5 +486,26 @@ async def slash_tgoo(inter: discord.Interaction):
     e.add_field(name="🕰️ Total", value=f"{bar(total_pct)}  `{counters.total_on} online · {counters.total_off} offline`", inline=False)
     await inter.followup.send(embed=e)
 
+# Add a command to manually reset/repair the database
+@bot.tree.command(name="purgeactivity", description="[ADMIN] Reset all activity data (use with caution!)")
+@commands.cooldown(COMMAND_COOLDOWN, COMMAND_COOLDOWN, commands.BucketType.user)
+async def slash_purgeactivity(inter: discord.Interaction, confirm: str = None):
+    if not inter.user.guild_permissions.administrator:
+        return await inter.response.send_message(embed=error("Administrator permission required"), ephemeral=True)
+    
+    if confirm != "YES-ERASE-ALL":
+        e = royal_embed("⚠️ Danger Zone", 0xFF9900,
+                       "This will delete **all activity data** for this server.\n"
+                       "Type `/purgeactivity YES-ERASE-ALL` to confirm.")
+        return await inter.response.send_message(embed=e, ephemeral=True)
+    
+    await bot.db_ready.wait()
+    async with bot.pool.acquire() as conn:
+        await conn.execute("DELETE FROM user_activity WHERE guild_id=$1", inter.guild_id)
+        await conn.execute("DELETE FROM guild_settings WHERE guild_id=$1", inter.guild_id)
+    
+    await inter.response.send_message(embed=success("All activity data has been purged. Tables have been reset."))
+
 # ---------- RUN ----------
-bot.run(TOKEN)
+if __name__ == "__main__":
+    bot.run(TOKEN)
